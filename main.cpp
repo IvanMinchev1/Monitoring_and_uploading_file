@@ -1,12 +1,26 @@
+/*
+    File: moveit_partial_delete_id.cpp
+
+    Explanation same as above.
+    Fully integrated worker approach.
+*/
+
 #include <CoreServices/CoreServices.h>
 #include <curl/curl.h>
+#include <CommonCrypto/CommonCrypto.h>
+
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <mutex>
 #include <string>
 #include <sstream>
-#include <ctime>
-#include <fstream>
-#include <CommonCrypto/CommonCrypto.h> 
+#include <thread>
+#include <unordered_map>
+#include <chrono>
+
+namespace fs = std::filesystem;
 
 enum class LogLevel {
     INFO,
@@ -16,7 +30,8 @@ enum class LogLevel {
 
 static void logMessage(LogLevel level, const std::string& msg)
 {
-    auto now = std::time(nullptr);
+    using namespace std::chrono;
+    auto now = system_clock::to_time_t(system_clock::now());
     std::tm localTime{};
     localtime_r(&now, &localTime);
 
@@ -33,28 +48,46 @@ static void logMessage(LogLevel level, const std::string& msg)
     std::cout << oss.str() << std::endl;
 }
 
-static std::string g_moveitServer;  
-static std::string g_accessToken;   
-static std::string g_folderId;      
+static std::string g_moveitServer;
+static std::string g_accessToken;
+static std::string g_folderId;
 
+enum class LocalEventType {
+    Created,
+    Modified
+};
 
+struct FileTrack {
+    LocalEventType eventType;
+    std::chrono::steady_clock::time_point lastEvent;
+    uintmax_t lastSize;
+    bool needsUpload;
+    std::string remoteFileId;
+};
+
+static std::unordered_map<std::string, FileTrack> g_fileMap;
+static std::mutex g_fileMapMutex;
+static bool g_stopWorker = false;
+static std::thread g_workerThread;
+
+// cURL callback
 static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, void* userdata)
 {
     std::string* str = static_cast<std::string*>(userdata);
-    str->append(static_cast<char*>(ptr), size * nmemb);
+    str->append((char*)ptr, size * nmemb);
     return size * nmemb;
 }
 
-bool GetMoveItAuthToken_UserPassword(const std::string& username,
-                                     const std::string& password)
+// 1) Auth
+bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::string& password)
 {
     CURL* curl = curl_easy_init();
     if (!curl) {
-        logMessage(LogLevel::ERROR, "Failed to init cURL in GetMoveItAuthToken_UserPassword.");
+        logMessage(LogLevel::ERROR, "Failed cURL init for auth.");
         return false;
     }
 
-    std::string url        = g_moveitServer + "/api/v1/auth/token";
+    std::string url = g_moveitServer + "/api/v1/auth/token";
     std::string postFields = "grant_type=password&username=" + username + "&password=" + password;
 
     struct curl_slist* headers = nullptr;
@@ -67,7 +100,7 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    CURLcode res = curl_easy_perform(curl);
+    auto res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         logMessage(LogLevel::ERROR, "Auth request failed: " + std::string(curl_easy_strerror(res)));
         curl_slist_free_all(headers);
@@ -75,19 +108,21 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username,
         return false;
     }
 
-    long httpCode;
+    long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     if (httpCode < 200 || httpCode >= 300) {
-        logMessage(LogLevel::ERROR, "Auth request got HTTP code: " + std::to_string(httpCode));
-        logMessage(LogLevel::ERROR, "Response: " + response);
+        logMessage(LogLevel::ERROR, "Auth HTTP code: " + std::to_string(httpCode));
+        logMessage(LogLevel::ERROR, "Resp: " + response);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return false;
     }
-    std::string tokenKey = "\"access_token\":\"";
-    auto pos = response.find(tokenKey);
+
+    // parse "access_token":"..."
+    std::string key = "\"access_token\":\"";
+    auto pos = response.find(key);
     if (pos != std::string::npos) {
-        pos += tokenKey.size();
+        pos += key.size();
         auto endPos = response.find("\"", pos);
         if (endPos != std::string::npos) {
             g_accessToken = response.substr(pos, endPos - pos);
@@ -98,33 +133,33 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username,
     curl_easy_cleanup(curl);
 
     if (g_accessToken.empty()) {
-        logMessage(LogLevel::ERROR, "Failed to parse access token: " + response);
+        logMessage(LogLevel::ERROR, "Cannot parse access token from: " + response);
         return false;
     }
 
-    logMessage(LogLevel::INFO, "Successfully obtained MOVEit access token.");
+    logMessage(LogLevel::INFO, "Authenticated => got token.");
     return true;
 }
 
+// 2) folderId
 bool GetFolderIdFromSelf()
 {
-    if (g_accessToken.empty()) {
-        logMessage(LogLevel::ERROR, "No token. Cannot retrieve folderId.");
-        return false;
-    }
+    if (g_accessToken.empty()) return false;
 
+    
     std::string url = g_moveitServer + "/api/v1/users/self";
-
+    
     CURL* curl = curl_easy_init();
     if (!curl) {
-        logMessage(LogLevel::ERROR, "Failed to init cURL in GetFolderIdFromSelf.");
+        logMessage(LogLevel::ERROR, "Failed cURL in GetFolderIdFromSelf.");
         return false;
     }
 
     struct curl_slist* headers = nullptr;
-    std::string authHeader = "Authorization: Bearer " + g_accessToken;
+    auto authHeader = "Authorization: Bearer " + g_accessToken;
     headers = curl_slist_append(headers, authHeader.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
 
@@ -132,7 +167,7 @@ bool GetFolderIdFromSelf()
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    CURLcode res = curl_easy_perform(curl);
+    auto res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         logMessage(LogLevel::ERROR, "GetFolderIdFromSelf failed: " + std::string(curl_easy_strerror(res)));
         curl_slist_free_all(headers);
@@ -140,38 +175,33 @@ bool GetFolderIdFromSelf()
         return false;
     }
 
-    long httpCode;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    if (httpCode < 200 || httpCode >= 300) {
-        logMessage(LogLevel::ERROR, "/users/self returned HTTP " + std::to_string(httpCode));
-        logMessage(LogLevel::ERROR, "Response: " + response);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    if (code < 200 || code >= 300) {
+        logMessage(LogLevel::ERROR, "/users/self code: " + std::to_string(code));
+        logMessage(LogLevel::ERROR, "Resp: " + response);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return false;
     }
 
-    const std::string key = "\"homeFolderID\":";
+    std::string key = "\"homeFolderID\":";
     auto pos = response.find(key);
     if (pos == std::string::npos) {
-        logMessage(LogLevel::ERROR, "Failed to find 'homeFolderID' in response: " + response);
+        logMessage(LogLevel::ERROR, "No homeFolderID in: " + response);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return false;
     }
 
     pos += key.size();
-    while (pos < response.size() && isspace(static_cast<unsigned char>(response[pos]))) {
-        pos++;
-    }
-
-    if (pos < response.size() && response[pos] == '"') {
-        pos++;
-    }
+    while (pos < response.size() && isspace((unsigned char)response[pos])) pos++;
+    if (pos < response.size() && response[pos] == '"') pos++;
 
     std::string idStr;
     while (pos < response.size()) {
         char c = response[pos];
-        if ((c >= '0' && c <= '9') || c == '-') {
+        if ((c >= '0' && c <= '9') || c=='-') {
             idStr.push_back(c);
         } else {
             break;
@@ -183,20 +213,21 @@ bool GetFolderIdFromSelf()
     curl_easy_cleanup(curl);
 
     if (idStr.empty()) {
-        logMessage(LogLevel::ERROR, "No numeric folderId found in /users/self: " + response);
+        logMessage(LogLevel::ERROR, "Failed parse folderId from: " + response);
         return false;
     }
-
+    
     g_folderId = idStr;
-    logMessage(LogLevel::INFO, "Discovered folderId (homeFolderID) = " + g_folderId);
+    logMessage(LogLevel::INFO, "Got folderId=" + g_folderId);
     return true;
 }
 
+// compute SHA-256
 static std::string ComputeSHA256Hex(const std::string& filePath)
 {
     std::ifstream ifs(filePath, std::ios::binary);
     if (!ifs.is_open()) {
-        logMessage(LogLevel::ERROR, "ComputeSHA256Hex: cannot open file: " + filePath);
+        logMessage(LogLevel::ERROR, "Cannot open for hashing: " + filePath);
         return "";
     }
 
@@ -207,9 +238,9 @@ static std::string ComputeSHA256Hex(const std::string& filePath)
     char buffer[bufSize];
     while (ifs.good()) {
         ifs.read(buffer, bufSize);
-        std::streamsize bytesRead = ifs.gcount();
+        auto bytesRead = ifs.gcount();
         if (bytesRead > 0) {
-            CC_SHA256_Update(&ctx, buffer, static_cast<CC_LONG>(bytesRead));
+            CC_SHA256_Update(&ctx, buffer, (CC_LONG)bytesRead);
         }
     }
     ifs.close();
@@ -218,56 +249,105 @@ static std::string ComputeSHA256Hex(const std::string& filePath)
     CC_SHA256_Final(hash, &ctx);
 
     std::ostringstream oss;
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    for (int i=0; i<CC_SHA256_DIGEST_LENGTH; i++) {
         oss << std::hex << std::setw(2) << std::setfill('0')
-            << static_cast<int>(hash[i]);
+            << (int)hash[i];
     }
     return oss.str();
 }
 
-bool UploadFileToFolder(const std::string& localFilePath)
+// DELETE /api/v1/files/{id}
+bool DeleteFileById(const std::string& fileId)
 {
-    if (g_accessToken.empty()) {
-        logMessage(LogLevel::ERROR, "No token. Cannot upload.");
+    if (fileId.empty()) {
         return false;
     }
-    if (g_folderId.empty()) {
-        logMessage(LogLevel::ERROR, "No folderId. Cannot upload.");
+    std::string url = g_moveitServer + "/api/v1/files/" + fileId;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        logMessage(LogLevel::ERROR, "cURL init fail in DeleteFileById.");
         return false;
     }
+
+    struct curl_slist* headers = nullptr;
+    auto authHeader = "Authorization: Bearer " + g_accessToken;
+    headers = curl_slist_append(headers, authHeader.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    auto res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        logMessage(LogLevel::ERROR, "Delete request fail: " + std::string(curl_easy_strerror(res)));
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    long code=0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    if (code<200 || code>=300) {
+        logMessage(LogLevel::ERROR, "Delete code=" + std::to_string(code));
+        logMessage(LogLevel::ERROR, "Resp: " + response);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    logMessage(LogLevel::INFO, "Deleted file ID=" + fileId);
+    return true;
+}
+
+// POST => parse "id":"..."
+std::string UploadFile_GetNewId(const std::string& localFilePath)
+{
+    if (g_accessToken.empty()||g_folderId.empty()) return "";
 
     std::string fileHash = ComputeSHA256Hex(localFilePath);
     if (fileHash.empty()) {
-        logMessage(LogLevel::ERROR, "Skipping upload because file hashing failed.");
-        return false;
+        return "";
     }
-
     std::string url = g_moveitServer + "/api/v1/folders/" + g_folderId + "/files";
 
     CURL* curl = curl_easy_init();
     if (!curl) {
-        logMessage(LogLevel::ERROR, "Failed to init cURL in UploadFileToFolder.");
-        return false;
+        logMessage(LogLevel::ERROR, "Failed cURL in UploadFile_GetNewId.");
+        return "";
     }
+
     curl_mime* form = curl_mime_init(curl);
-    curl_mimepart* part = curl_mime_addpart(form);
+
+    // hashtype
+    auto part = curl_mime_addpart(form);
     curl_mime_name(part, "hashtype");
     curl_mime_data(part, "sha-256", CURL_ZERO_TERMINATED);
 
+    // hash
     part = curl_mime_addpart(form);
     curl_mime_name(part, "hash");
     curl_mime_data(part, fileHash.c_str(), CURL_ZERO_TERMINATED);
 
+    // file
     part = curl_mime_addpart(form);
     curl_mime_name(part, "file");
     curl_mime_filedata(part, localFilePath.c_str());
 
+    // comments
     part = curl_mime_addpart(form);
     curl_mime_name(part, "comments");
-    curl_mime_data(part, "Uploaded by C++ code", CURL_ZERO_TERMINATED);
+    curl_mime_data(part, "Partial-write safe + ID-based delete", CURL_ZERO_TERMINATED);
 
-    struct curl_slist* headers = nullptr;
-    std::string authHeader = "Authorization: Bearer " + g_accessToken;
+    struct curl_slist* headers=nullptr;
+    auto authHeader = "Authorization: Bearer " + g_accessToken;
     headers = curl_slist_append(headers, authHeader.c_str());
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -278,149 +358,300 @@ bool UploadFileToFolder(const std::string& localFilePath)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        logMessage(LogLevel::ERROR, "Upload request failed: " + std::string(curl_easy_strerror(res)));
+    auto res2 = curl_easy_perform(curl);
+    if (res2 != CURLE_OK) {
+        logMessage(LogLevel::ERROR, "Upload fail: " + std::string(curl_easy_strerror(res2)));
         curl_mime_free(form);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        return false;
+        return "";
     }
 
-    long httpCode;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    if (httpCode < 200 || httpCode >= 300) {
-        logMessage(LogLevel::ERROR, "Upload got HTTP code: " + std::to_string(httpCode));
-        logMessage(LogLevel::ERROR, "Response: " + response);
+    long code=0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    if (code<200 || code>=300) {
+        logMessage(LogLevel::ERROR, "Upload code=" + std::to_string(code));
+        logMessage(LogLevel::ERROR, "Resp: " + response);
         curl_mime_free(form);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        return false;
+        return "";
     }
 
-    // Cleanup
+    // parse "id":"..."
+    std::string newId;
+    std::string idKey="\"id\":\"";
+    auto p = response.find(idKey);
+    if (p!=std::string::npos) {
+        p+=idKey.size();
+        auto e = response.find("\"", p);
+        if (e!=std::string::npos) {
+            newId= response.substr(p, e-p);
+        }
+    }
+    if (!newId.empty()) {
+        logMessage(LogLevel::INFO, "Uploaded => new ID=" + newId);
+    } else {
+        logMessage(LogLevel::WARN, "Upload success but can't parse 'id': " + response);
+    }
+
+    
     curl_mime_free(form);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    logMessage(LogLevel::INFO, "Uploaded file successfully to folder " + g_folderId + ": " + localFilePath);
-    return true;
+    return newId;
 }
 
-static void fileSystemEventCallback(
-    ConstFSEventStreamRef /*streamRef*/,
-    void* /*clientCallBackInfo*/,
-    size_t numEvents,
-    void* eventPaths,
-    const FSEventStreamEventFlags eventFlags[],
-    const FSEventStreamEventId /*eventIds*/[])
+// We'll store info outside. This struct for final actions.
+struct StableFile {
+    std::string path;
+    LocalEventType eventType;
+    std::string oldFileId; // if we had previously uploaded
+};
+
+static void UploadStableFilesWorker()
 {
-    char** paths = static_cast<char**>(eventPaths);
+    const int STABILITY_SECONDS=3;
 
-    for (size_t i = 0; i < numEvents; ++i) {
-        std::string changedPath = paths[i];
-        FSEventStreamEventFlags flags = eventFlags[i];
+    while(!g_stopWorker) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
-        logMessage(LogLevel::INFO, "FSEvents: Detected change at path: " + changedPath);
+        std::vector<StableFile> stableList;
 
-        if (flags & kFSEventStreamEventFlagItemCreated) {
-            if (!UploadFileToFolder(changedPath)) {
-                logMessage(LogLevel::ERROR, "Failed to upload: " + changedPath);
+        {
+            std::lock_guard<std::mutex> lock(g_fileMapMutex);
+            auto now=std::chrono::steady_clock::now();
+
+            for (auto it=g_fileMap.begin(); it!=g_fileMap.end();) {
+                auto& ft=it->second;
+                if (!ft.needsUpload) {
+                    ++it;
+                    continue;
+                }
+
+                auto diff = now - ft.lastEvent;
+                if (std::chrono::duration_cast<std::chrono::seconds>(diff).count() >= STABILITY_SECONDS) {
+                    // check if size stable
+                    bool fileOk=true;
+                    uintmax_t curSize=0;
+                    try{
+                        curSize=fs::file_size(it->first);
+                    } catch(...){
+                        fileOk=false;
+                    }
+                    if (fileOk && curSize==ft.lastSize) {
+                        // stable => remove from map
+                        StableFile sf;
+                        sf.path = it->first;
+                        sf.eventType = ft.eventType;
+                        sf.oldFileId = ft.remoteFileId; // might be empty if never uploaded
+                        stableList.push_back(sf);
+
+                        it=g_fileMap.erase(it);
+                        continue;
+                    } else {
+                        // still changing
+                        ft.lastSize=curSize;
+                        ft.lastEvent=now;
+                    }
+                }
+                ++it;
+            }
+        }
+
+        // handle stable files
+        for (auto& sf: stableList) {
+            if (sf.eventType==LocalEventType::Created) {
+                // upload => parse new ID => store back in map
+                auto newId= UploadFile_GetNewId(sf.path);
+                if (!newId.empty()) {
+                    FileTrack track;
+                    track.eventType=LocalEventType::Created;
+                    track.lastEvent=std::chrono::steady_clock::now();
+                    track.lastSize=0;
+                    track.needsUpload=false;
+                    track.remoteFileId=newId;
+
+                    std::lock_guard<std::mutex> lock(g_fileMapMutex);
+                    g_fileMap[sf.path]=track;
+                }
+            } else {
+                // Modified => if oldFileId => delete => re-upload
+                if (!sf.oldFileId.empty()) {
+                    logMessage(LogLevel::INFO, "Modified => Deleting old file ID=" + sf.oldFileId);
+                    if (!DeleteFileById(sf.oldFileId)) {
+                        logMessage(LogLevel::WARN, "Delete old file ID failed, continue upload...");
+                    }
+                }
+                // re-upload
+                auto newId= UploadFile_GetNewId(sf.path);
+                if (!newId.empty()) {
+                    FileTrack track;
+                    track.eventType=LocalEventType::Modified;
+                    track.lastEvent=std::chrono::steady_clock::now();
+                    track.lastSize=0;
+                    track.needsUpload=false;
+                    track.remoteFileId=newId;
+
+                    std::lock_guard<std::mutex> lock(g_fileMapMutex);
+                    g_fileMap[sf.path]=track;
+                }
             }
         }
     }
 }
 
+// FSEvents callback
+static void fileSystemEventCallback(
+    ConstFSEventStreamRef /*ref*/,
+    void* /*ctx*/,
+    size_t numEvents,
+    void* eventPaths,
+    const FSEventStreamEventFlags flags[],
+    const FSEventStreamEventId /*ids*/[])
+{
+    char** paths = (char**)eventPaths;
 
+    for (size_t i=0; i<numEvents; i++){
+        std::string localPath= paths[i];
+        bool isCreated  = (flags[i] & kFSEventStreamEventFlagItemCreated)!=0;
+        bool isModified = (flags[i] & kFSEventStreamEventFlagItemModified)!=0;
+
+        if (!isCreated && !isModified) {
+            continue;
+        }
+        auto eType = isCreated ? LocalEventType::Created : LocalEventType::Modified;
+
+        logMessage(LogLevel::INFO, (isCreated ? "CREATED " : "MODIFIED ") + localPath);
+
+        uintmax_t sz=0;
+        try {
+            sz= fs::file_size(localPath);
+        } catch(...) {
+            // maybe locked
+        }
+
+        auto now= std::chrono::steady_clock::now();
+
+        std::lock_guard<std::mutex> lock(g_fileMapMutex);
+
+        auto it=g_fileMap.find(localPath);
+        if (it==g_fileMap.end()) {
+            FileTrack ft;
+            ft.eventType=eType;
+            ft.lastEvent=now;
+            ft.lastSize=sz;
+            ft.needsUpload=true;
+            ft.remoteFileId=""; 
+            g_fileMap[localPath]=ft;
+        } else {
+            auto& ft= it->second;
+            // if previously Created, now Modified => set eventType=Modified
+            if (ft.eventType==LocalEventType::Created && eType==LocalEventType::Modified) {
+                ft.eventType=LocalEventType::Modified;
+            }
+            ft.lastEvent= now;
+            ft.lastSize= sz;
+            ft.needsUpload=true;
+            // keep old remoteFileId so we can delete the correct file
+        }
+    }
+}
+
+// main
 int main(int argc, char* argv[])
 {
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <MOVEitServerURL> <username> <password> <localFolderPath>\n";
+    if (argc<5) {
+        std::cerr<<"Usage: "<<argv[0]<<" <MOVEitServerURL> <username> <password> <localFolderPath>\n";
         return 1;
     }
 
-    g_moveitServer  = argv[1];
-    std::string user = argv[2];
-    std::string pass = argv[3];
-    std::string watchDir = argv[4];
+    g_moveitServer= argv[1];
+    std::string user= argv[2];
+    std::string pass= argv[3];
+    std::string watchDir= argv[4];
 
-    
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    
+   
     if (!GetMoveItAuthToken_UserPassword(user, pass)) {
-        logMessage(LogLevel::ERROR, "Authentication failed. Exiting.");
+        logMessage(LogLevel::ERROR, "Auth fail => exit.");
         curl_global_cleanup();
         return 1;
     }
 
     
     if (!GetFolderIdFromSelf()) {
-        logMessage(LogLevel::ERROR, "Cannot proceed without folderId. Exiting.");
+        logMessage(LogLevel::ERROR, "No folderId => exit.");
         curl_global_cleanup();
         return 1;
     }
 
-    
-    CFStringRef cfPath = CFStringCreateWithCString(
+    CFStringRef cfPath= CFStringCreateWithCString(
         kCFAllocatorDefault,
         watchDir.c_str(),
         kCFStringEncodingUTF8
     );
-    CFArrayRef pathsToWatch = CFArrayCreate(
+    CFArrayRef paths= CFArrayCreate(
         kCFAllocatorDefault,
-        reinterpret_cast<const void**>(&cfPath),
+        (const void**)&cfPath,
         1,
         nullptr
     );
 
-    FSEventStreamContext context = {0, nullptr, nullptr, nullptr, nullptr};
-    FSEventStreamRef stream = FSEventStreamCreate(
+    FSEventStreamContext ctx= {0, nullptr, nullptr, nullptr, nullptr};
+    FSEventStreamRef stream= FSEventStreamCreate(
         kCFAllocatorDefault,
         &fileSystemEventCallback,
-        &context,
-        pathsToWatch,
+        &ctx,
+        paths,
         kFSEventStreamEventIdSinceNow,
         1.0,
         kFSEventStreamCreateFlagFileEvents
     );
 
     if (!stream) {
-        logMessage(LogLevel::ERROR, "Failed to create FSEventStream. Exiting.");
+        logMessage(LogLevel::ERROR, "FSEventStreamCreate fail => exit.");
         CFRelease(cfPath);
-        CFRelease(pathsToWatch);
+        CFRelease(paths);
         curl_global_cleanup();
         return 1;
     }
 
     FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
     if (!FSEventStreamStart(stream)) {
-        logMessage(LogLevel::ERROR, "Failed to start FSEventStream. Exiting.");
+        logMessage(LogLevel::ERROR, "FSEventStreamStart fail => exit.");
         FSEventStreamRelease(stream);
         CFRelease(cfPath);
-        CFRelease(pathsToWatch);
+        CFRelease(paths);
         curl_global_cleanup();
         return 1;
     }
 
-    
+
     CFRelease(cfPath);
-    CFRelease(pathsToWatch);
+    CFRelease(paths);
 
-    logMessage(LogLevel::INFO, "Watching folder: " + watchDir);
-    logMessage(LogLevel::INFO, "Folder ID: " + g_folderId);
-    logMessage(LogLevel::INFO, "New files => POST /api/v1/folders/" + g_folderId + "/files");
-    logMessage(LogLevel::INFO, "Press Ctrl+C to exit...");
+    // Start the worker
+    g_workerThread= std::thread(UploadStableFilesWorker);
 
-    
-    CFRunLoopRun();
+    logMessage(LogLevel::INFO, "Watching dir: "+watchDir);
+    logMessage(LogLevel::INFO, "folderId= "+ g_folderId);
+    logMessage(LogLevel::INFO, "Partial write safe => wait 3s. Created => upload; Modified => delete old ID => upload.");
 
-    
-    logMessage(LogLevel::WARN, "Exiting run loop.");
+    CFRunLoopRun(); // blocks
+
+    logMessage(LogLevel::WARN, "Exiting CFRunLoop...");
     FSEventStreamStop(stream);
     FSEventStreamInvalidate(stream);
     FSEventStreamRelease(stream);
+
+    {
+        std::lock_guard<std::mutex> lock(g_fileMapMutex);
+        g_stopWorker= true;
+    }
+    g_workerThread.join();
 
     curl_global_cleanup();
     return 0;
