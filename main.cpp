@@ -1,14 +1,6 @@
-/*
-    File: moveit_partial_delete_id.cpp
-
-    Explanation same as above.
-    Fully integrated worker approach.
-*/
-
 #include <CoreServices/CoreServices.h>
 #include <curl/curl.h>
 #include <CommonCrypto/CommonCrypto.h>
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -70,7 +62,7 @@ static std::mutex g_fileMapMutex;
 static bool g_stopWorker = false;
 static std::thread g_workerThread;
 
-// cURL callback
+
 static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, void* userdata)
 {
     std::string* str = static_cast<std::string*>(userdata);
@@ -78,7 +70,7 @@ static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, void* userdata
     return size * nmemb;
 }
 
-// 1) Auth
+
 bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::string& password)
 {
     CURL* curl = curl_easy_init();
@@ -118,7 +110,7 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::str
         return false;
     }
 
-    // parse "access_token":"..."
+    
     std::string key = "\"access_token\":\"";
     auto pos = response.find(key);
     if (pos != std::string::npos) {
@@ -141,14 +133,14 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::str
     return true;
 }
 
-// 2) folderId
+
 bool GetFolderIdFromSelf()
 {
     if (g_accessToken.empty()) return false;
 
     
     std::string url = g_moveitServer + "/api/v1/users/self";
-    
+
     CURL* curl = curl_easy_init();
     if (!curl) {
         logMessage(LogLevel::ERROR, "Failed cURL in GetFolderIdFromSelf.");
@@ -222,7 +214,7 @@ bool GetFolderIdFromSelf()
     return true;
 }
 
-// compute SHA-256
+
 static std::string ComputeSHA256Hex(const std::string& filePath)
 {
     std::ifstream ifs(filePath, std::ios::binary);
@@ -256,7 +248,7 @@ static std::string ComputeSHA256Hex(const std::string& filePath)
     return oss.str();
 }
 
-// DELETE /api/v1/files/{id}
+
 bool DeleteFileById(const std::string& fileId)
 {
     if (fileId.empty()) {
@@ -307,7 +299,7 @@ bool DeleteFileById(const std::string& fileId)
     return true;
 }
 
-// POST => parse "id":"..."
+
 std::string UploadFile_GetNewId(const std::string& localFilePath)
 {
     if (g_accessToken.empty()||g_folderId.empty()) return "";
@@ -326,22 +318,22 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
 
     curl_mime* form = curl_mime_init(curl);
 
-    // hashtype
+
     auto part = curl_mime_addpart(form);
     curl_mime_name(part, "hashtype");
     curl_mime_data(part, "sha-256", CURL_ZERO_TERMINATED);
 
-    // hash
+    
     part = curl_mime_addpart(form);
     curl_mime_name(part, "hash");
     curl_mime_data(part, fileHash.c_str(), CURL_ZERO_TERMINATED);
 
-    // file
+
     part = curl_mime_addpart(form);
     curl_mime_name(part, "file");
     curl_mime_filedata(part, localFilePath.c_str());
 
-    // comments
+    
     part = curl_mime_addpart(form);
     curl_mime_name(part, "comments");
     curl_mime_data(part, "Partial-write safe + ID-based delete", CURL_ZERO_TERMINATED);
@@ -378,7 +370,7 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
         return "";
     }
 
-    // parse "id":"..."
+    
     std::string newId;
     std::string idKey="\"id\":\"";
     auto p = response.find(idKey);
@@ -403,11 +395,11 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
     return newId;
 }
 
-// We'll store info outside. This struct for final actions.
+
 struct StableFile {
     std::string path;
     LocalEventType eventType;
-    std::string oldFileId; // if we had previously uploaded
+    std::string oldFileId; 
 };
 
 static void UploadStableFilesWorker()
@@ -432,7 +424,7 @@ static void UploadStableFilesWorker()
 
                 auto diff = now - ft.lastEvent;
                 if (std::chrono::duration_cast<std::chrono::seconds>(diff).count() >= STABILITY_SECONDS) {
-                    // check if size stable
+                    
                     bool fileOk=true;
                     uintmax_t curSize=0;
                     try{
@@ -441,17 +433,17 @@ static void UploadStableFilesWorker()
                         fileOk=false;
                     }
                     if (fileOk && curSize==ft.lastSize) {
-                        // stable => remove from map
+                        
                         StableFile sf;
                         sf.path = it->first;
                         sf.eventType = ft.eventType;
-                        sf.oldFileId = ft.remoteFileId; // might be empty if never uploaded
+                        sf.oldFileId = ft.remoteFileId;
                         stableList.push_back(sf);
 
                         it=g_fileMap.erase(it);
                         continue;
                     } else {
-                        // still changing
+                        
                         ft.lastSize=curSize;
                         ft.lastEvent=now;
                     }
@@ -460,10 +452,10 @@ static void UploadStableFilesWorker()
             }
         }
 
-        // handle stable files
+        
         for (auto& sf: stableList) {
             if (sf.eventType==LocalEventType::Created) {
-                // upload => parse new ID => store back in map
+                
                 auto newId= UploadFile_GetNewId(sf.path);
                 if (!newId.empty()) {
                     FileTrack track;
@@ -477,14 +469,14 @@ static void UploadStableFilesWorker()
                     g_fileMap[sf.path]=track;
                 }
             } else {
-                // Modified => if oldFileId => delete => re-upload
+                
                 if (!sf.oldFileId.empty()) {
                     logMessage(LogLevel::INFO, "Modified => Deleting old file ID=" + sf.oldFileId);
                     if (!DeleteFileById(sf.oldFileId)) {
                         logMessage(LogLevel::WARN, "Delete old file ID failed, continue upload...");
                     }
                 }
-                // re-upload
+                
                 auto newId= UploadFile_GetNewId(sf.path);
                 if (!newId.empty()) {
                     FileTrack track;
@@ -502,14 +494,14 @@ static void UploadStableFilesWorker()
     }
 }
 
-// FSEvents callback
+
 static void fileSystemEventCallback(
-    ConstFSEventStreamRef /*ref*/,
-    void* /*ctx*/,
+    ConstFSEventStreamRef,
+    void* ,
     size_t numEvents,
     void* eventPaths,
     const FSEventStreamEventFlags flags[],
-    const FSEventStreamEventId /*ids*/[])
+    const FSEventStreamEventId [])
 {
     char** paths = (char**)eventPaths;
 
@@ -529,7 +521,7 @@ static void fileSystemEventCallback(
         try {
             sz= fs::file_size(localPath);
         } catch(...) {
-            // maybe locked
+            
         }
 
         auto now= std::chrono::steady_clock::now();
@@ -547,19 +539,19 @@ static void fileSystemEventCallback(
             g_fileMap[localPath]=ft;
         } else {
             auto& ft= it->second;
-            // if previously Created, now Modified => set eventType=Modified
+            
             if (ft.eventType==LocalEventType::Created && eType==LocalEventType::Modified) {
                 ft.eventType=LocalEventType::Modified;
             }
             ft.lastEvent= now;
             ft.lastSize= sz;
             ft.needsUpload=true;
-            // keep old remoteFileId so we can delete the correct file
+            
         }
     }
 }
 
-// main
+
 int main(int argc, char* argv[])
 {
     if (argc<5) {
@@ -633,14 +625,14 @@ int main(int argc, char* argv[])
     CFRelease(cfPath);
     CFRelease(paths);
 
-    // Start the worker
+    
     g_workerThread= std::thread(UploadStableFilesWorker);
 
     logMessage(LogLevel::INFO, "Watching dir: "+watchDir);
     logMessage(LogLevel::INFO, "folderId= "+ g_folderId);
     logMessage(LogLevel::INFO, "Partial write safe => wait 3s. Created => upload; Modified => delete old ID => upload.");
 
-    CFRunLoopRun(); // blocks
+    CFRunLoopRun(); 
 
     logMessage(LogLevel::WARN, "Exiting CFRunLoop...");
     FSEventStreamStop(stream);
