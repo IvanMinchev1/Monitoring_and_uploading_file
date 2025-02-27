@@ -1,21 +1,3 @@
-/*
-    File: moveit_partial_delete_id_with_history.cpp
-
-    Demonstrates:
-      1) macOS FSEvents for created vs. modified files (partial-write safe).
-      2) ID-based approach to avoid deleting the wrong file on MOVEit:
-         - We store the returned "id" from each upload, and delete that exact file if modified.
-      3) A "history log" in the watched directory, storing all requests, responses, 
-         and parsed parameters (folderId, accessToken, newFileId).
-      4) We skip detecting modifications to the "history_log.txt" file itself.
-
-    Build (macOS):
-      clang++ moveit_partial_delete_id_with_history.cpp -std=c++17 -lcurl -framework CoreServices -framework CommonCrypto -o moveit_partial_delete_id_with_history
-
-    Usage:
-      ./moveit_partial_delete_id_with_history <MOVEitServerURL> <username> <password> <localFolderPath>
-*/
-
 #include <CoreServices/CoreServices.h>
 #include <curl/curl.h>
 #include <CommonCrypto/CommonCrypto.h>
@@ -33,9 +15,6 @@
 
 namespace fs = std::filesystem;
 
-// -----------------------------------------------------------------------------
-// Logging to console
-// -----------------------------------------------------------------------------
 enum class LogLevel {
     INFO,
     WARN,
@@ -62,18 +41,13 @@ static void logMessage(LogLevel level, const std::string& msg)
     std::cout << oss.str() << std::endl;
 }
 
-// -----------------------------------------------------------------------------
-// History Log: We'll keep an extra file in the same directory for request/response logs
-// -----------------------------------------------------------------------------
-static std::string g_historyLogFile; // e.g. watchDir + "/history_log.txt"
+static std::string g_historyLogFile;
 static std::mutex g_historyLogMutex;
 
-// Helper to append messages to the log file
 static void AppendToHistoryLog(const std::string& message)
 {
     std::lock_guard<std::mutex> lock(g_historyLogMutex);
 
-    // Timestamp
     using namespace std::chrono;
     auto now = system_clock::to_time_t(system_clock::now());
     std::tm localTime{};
@@ -82,35 +56,27 @@ static void AppendToHistoryLog(const std::string& message)
     std::ostringstream stamp;
     stamp << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S") << " [HIST] ";
 
-    // Open in append mode
     std::ofstream ofs(g_historyLogFile, std::ios::app);
     if (ofs.is_open()) {
         ofs << stamp.str() << message << "\n";
     }
-    // close automatically on ofs destruction
 }
 
-// -----------------------------------------------------------------------------
-// Global Vars
-// -----------------------------------------------------------------------------
 static std::string g_moveitServer;
 static std::string g_accessToken;
 static std::string g_folderId;
 
-// Distinguish local file events: Created vs. Modified
 enum class LocalEventType {
     Created,
     Modified
 };
 
-// Info for each file in the map
 struct FileTrack {
     LocalEventType eventType;
     std::chrono::steady_clock::time_point lastEvent;
     uintmax_t lastSize;
     bool needsUpload;
 
-    // The unique MOVEit file ID from last upload (empty if never uploaded).
     std::string remoteFileId;
 };
 
@@ -119,9 +85,6 @@ static std::mutex g_fileMapMutex;
 static bool g_stopWorker = false;
 static std::thread g_workerThread;
 
-// -----------------------------------------------------------------------------
-// cURL Helper: WriteCallback
-// -----------------------------------------------------------------------------
 static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, void* userdata)
 {
     std::string* str = reinterpret_cast<std::string*>(userdata);
@@ -129,8 +92,6 @@ static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, void* userdata
     return size * nmemb;
 }
 
-// We'll define a function to perform cURL requests that logs requests/responses
-// This won't be necessary for every single approach, but let's do it for clarity.
 struct CurlResult {
     long httpCode;
     std::string responseBody;
@@ -139,15 +100,12 @@ struct CurlResult {
 
 static CurlResult PerformCurlRequest(CURL* curl, const std::string& requestDesc)
 {
-    // We'll do the request and capture response. We'll also log the requestDesc.
     AppendToHistoryLog("REQUEST => " + requestDesc);
 
-    // We'll set up to capture the response
     std::string response;
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    // Perform
     CURLcode res = curl_easy_perform(curl);
 
     CurlResult result;
@@ -156,7 +114,7 @@ static CurlResult PerformCurlRequest(CURL* curl, const std::string& requestDesc)
     result.success = false;
 
     if (res != CURLE_OK) {
-        // log failure
+
         std::string failMsg = "REQUEST FAILED => " + std::string(curl_easy_strerror(res));
         logMessage(LogLevel::ERROR, failMsg);
         AppendToHistoryLog(failMsg);
@@ -166,7 +124,6 @@ static CurlResult PerformCurlRequest(CURL* curl, const std::string& requestDesc)
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 
-    // Log the entire response
     {
         std::ostringstream respMsg;
         respMsg << "RESPONSE CODE => " << code << "\n";
@@ -180,9 +137,6 @@ static CurlResult PerformCurlRequest(CURL* curl, const std::string& requestDesc)
     return result;
 }
 
-// -----------------------------------------------------------------------------
-// Helper: compute SHA-256
-// -----------------------------------------------------------------------------
 static std::string ComputeSHA256Hex(const std::string& filePath)
 {
     std::ifstream ifs(filePath, std::ios::binary);
@@ -216,12 +170,8 @@ static std::string ComputeSHA256Hex(const std::string& filePath)
     return oss.str();
 }
 
-// -----------------------------------------------------------------------------
-// 1) Auth: POST /api/v1/auth/token => parse "access_token"
-// -----------------------------------------------------------------------------
 bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::string& password, bool /*logRequests*/)
 {
-    // We'll do the request using cURL. Then parse.
     CURL* curl = curl_easy_init();
     if (!curl) {
         logMessage(LogLevel::ERROR, "Failed to init cURL in GetMoveItAuthToken_UserPassword.");
@@ -249,7 +199,6 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::str
         return false;
     }
 
-    // parse "access_token":"..."
     std::string key = "\"access_token\":\"";
     auto pos = res.responseBody.find(key);
     if (pos != std::string::npos) {
@@ -266,7 +215,6 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::str
         return false;
     }
 
-    // Log the param
     {
         std::ostringstream paramMsg;
         paramMsg << "PARSED param => accessToken= " << g_accessToken.substr(0, 8) << "...(hidden)";
@@ -277,9 +225,6 @@ bool GetMoveItAuthToken_UserPassword(const std::string& username, const std::str
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// 2) folderId from /api/v1/users/self => parse "homeFolderID"
-// -----------------------------------------------------------------------------
 bool GetFolderIdFromSelf(bool /*logRequests*/)
 {
     if (g_accessToken.empty()) {
@@ -313,7 +258,6 @@ bool GetFolderIdFromSelf(bool /*logRequests*/)
         return false;
     }
 
-    // parse "homeFolderID":
     std::string key = "\"homeFolderID\":";
     auto pos = res.responseBody.find(key);
     if (pos == std::string::npos) {
@@ -350,8 +294,6 @@ bool GetFolderIdFromSelf(bool /*logRequests*/)
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// DELETE /api/v1/files/{id}
 bool DeleteFileById(const std::string& fileId)
 {
     if (fileId.empty()) return false;
@@ -387,15 +329,12 @@ bool DeleteFileById(const std::string& fileId)
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// POST /api/v1/folders/{folderId}/files => parse "id":"..."
 std::string UploadFile_GetNewId(const std::string& localFilePath)
 {
     if (g_accessToken.empty()||g_folderId.empty()) return "";
 
     std::string fileHash = ComputeSHA256Hex(localFilePath);
     if (fileHash.empty()) {
-        // error logged
         return "";
     }
 
@@ -410,22 +349,18 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
 
     curl_mime* form = curl_mime_init(curl);
 
-    // hashtype=sha-256
     auto part = curl_mime_addpart(form);
     curl_mime_name(part, "hashtype");
     curl_mime_data(part, "sha-256", CURL_ZERO_TERMINATED);
 
-    // hash
     part = curl_mime_addpart(form);
     curl_mime_name(part, "hash");
     curl_mime_data(part, fileHash.c_str(), CURL_ZERO_TERMINATED);
 
-    // file
     part = curl_mime_addpart(form);
     curl_mime_name(part, "file");
     curl_mime_filedata(part, localFilePath.c_str());
 
-    // comments
     part = curl_mime_addpart(form);
     curl_mime_name(part, "comments");
     curl_mime_data(part, "Uploaded partial-write safe (ID-based)", CURL_ZERO_TERMINATED);
@@ -449,7 +384,6 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
         return "";
     }
 
-    // parse "id":"..."
     std::string newId;
     std::string idKey="\"id\":\"";
     auto p= res.responseBody.find(idKey);
@@ -475,11 +409,10 @@ std::string UploadFile_GetNewId(const std::string& localFilePath)
     return newId;
 }
 
-// We'll store stable files in this struct for final action
 struct StableFile {
     std::string path;
     LocalEventType eventType;
-    std::string oldFileId; // from previous upload
+    std::string oldFileId;
 };
 
 static void UploadStableFilesWorker()
@@ -503,7 +436,6 @@ static void UploadStableFilesWorker()
                 }
                 auto diff= now- track.lastEvent;
                 if (std::chrono::duration_cast<std::chrono::seconds>(diff).count()>= STABILITY_SECONDS) {
-                    // check size
                     bool fileOK=true;
                     uintmax_t curSize=0;
                     try {
@@ -515,7 +447,7 @@ static void UploadStableFilesWorker()
                         StableFile sf;
                         sf.path= it->first;
                         sf.eventType= track.eventType;
-                        sf.oldFileId= track.remoteFileId; // might be empty
+                        sf.oldFileId= track.remoteFileId;
                         stableList.push_back(sf);
 
                         it= g_fileMap.erase(it);
@@ -529,13 +461,10 @@ static void UploadStableFilesWorker()
             }
         }
 
-        // handle stable files
         for (auto& sf: stableList) {
             if (sf.eventType==LocalEventType::Created) {
-                // upload => parse ID => store in map
                 auto newId= UploadFile_GetNewId(sf.path);
                 if (!newId.empty()) {
-                    // store to map
                     FileTrack ft;
                     ft.eventType= LocalEventType::Created;
                     ft.lastEvent= std::chrono::steady_clock::now();
@@ -547,7 +476,6 @@ static void UploadStableFilesWorker()
                     g_fileMap[sf.path]= ft;
                 }
             } else {
-                // Modified => if oldFileId => delete => re-upload
                 if (!sf.oldFileId.empty()) {
                     logMessage(LogLevel::INFO, "Modified => deleting old ID=" + sf.oldFileId);
                     if(!DeleteFileById(sf.oldFileId)) {
@@ -570,8 +498,6 @@ static void UploadStableFilesWorker()
         }
     }
 }
-
-// FSEvents callback
 static void fileSystemEventCallback(
     ConstFSEventStreamRef /*ref*/,
     void* /*ctx*/,
@@ -585,7 +511,7 @@ static void fileSystemEventCallback(
     for (size_t i=0; i<numEvents; i++){
         std::string localPath= paths[i];
 
-        // Skip if it's our history log file
+        
         if (localPath == g_historyLogFile) {
             // do nothing
             continue;
@@ -604,7 +530,8 @@ static void fileSystemEventCallback(
         try {
             sz= fs::file_size(localPath);
         } catch(...) {
-            // maybe locked
+            logMessage(LogLevel::ERROR, "fs::file_size fail => continue.");
+            continue;
         }
 
         auto now= std::chrono::steady_clock::now();
@@ -613,7 +540,7 @@ static void fileSystemEventCallback(
         std::lock_guard<std::mutex> lock(g_fileMapMutex);
         auto it= g_fileMap.find(localPath);
         if(it== g_fileMap.end()) {
-            // new
+            
             FileTrack ft;
             ft.eventType= eType;
             ft.lastEvent= now;
@@ -623,7 +550,6 @@ static void fileSystemEventCallback(
             g_fileMap[localPath]= ft;
         } else {
             auto& track= it->second;
-            // if was Created, now Modified => set eventType=Modified
             if (track.eventType==LocalEventType::Created && eType==LocalEventType::Modified) {
                 track.eventType= LocalEventType::Modified;
             }
@@ -634,7 +560,6 @@ static void fileSystemEventCallback(
     }
 }
 
-// main
 int main(int argc, char* argv[])
 {
     if(argc<5) {
@@ -647,26 +572,22 @@ int main(int argc, char* argv[])
     std::string pass= argv[3];
     std::string watchDir= argv[4];
 
-    // define history file path
     g_historyLogFile= watchDir + "/history_log.txt";
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // 1) auth
     if(!GetMoveItAuthToken_UserPassword(user, pass, true)) {
         logMessage(LogLevel::ERROR, "Auth fail => exit.");
         curl_global_cleanup();
         return 1;
     }
 
-    // 2) folderId
     if(!GetFolderIdFromSelf(true)) {
         logMessage(LogLevel::ERROR, "No folderId => exit.");
         curl_global_cleanup();
         return 1;
     }
 
-    // set up FSEvents
     CFStringRef cfPath= CFStringCreateWithCString(kCFAllocatorDefault,
                                                  watchDir.c_str(),
                                                  kCFStringEncodingUTF8);
@@ -709,7 +630,6 @@ int main(int argc, char* argv[])
     CFRelease(cfPath);
     CFRelease(paths);
 
-    // Start the worker
     g_workerThread= std::thread(UploadStableFilesWorker);
 
     logMessage(LogLevel::INFO, "Watching directory: " + watchDir);
@@ -722,10 +642,8 @@ int main(int argc, char* argv[])
     logMessage(LogLevel::INFO, "Handle partial writes (3s). Created => upload. Modified => delete old ID => upload.");
     logMessage(LogLevel::INFO, "Press Ctrl+C to exit.");
 
-    // CFRunLoop
     CFRunLoopRun();
 
-    // on exit
     logMessage(LogLevel::WARN, "Exiting CFRunLoop...");
     FSEventStreamStop(stream);
     FSEventStreamInvalidate(stream);
