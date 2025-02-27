@@ -1,7 +1,6 @@
 #include <CoreServices/CoreServices.h>
 #include <curl/curl.h>
 #include <CommonCrypto/CommonCrypto.h>
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
