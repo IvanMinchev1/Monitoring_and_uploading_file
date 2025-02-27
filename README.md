@@ -23,6 +23,7 @@ This project is a **macOS** application that:
 1. **Install** libcurl, e.g. `brew install curl` (if not already installed). 
 
 2. **Running** 
+
                 clang++ main.cpp \
                     -std=c++17 \
                      -lcurl \
