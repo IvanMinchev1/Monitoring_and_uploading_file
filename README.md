@@ -22,14 +22,15 @@ This project is a **macOS** application that:
 ## Building
 1. **Install** libcurl, e.g. `brew install curl` (if not already installed). 
 
-2. **Running** clang++ main.cpp \
+2. **Running** 
+                clang++ main.cpp \
                     -std=c++17 \
                      -lcurl \
                     -framework CoreServices \
                     -framework CommonCrypto \
                     -o moveit_file_watcher
 
----------**if its not running try:**----------
+3. **if its not running try this**
 
                 clang++ main.cpp \
                     -std=c++17 \
